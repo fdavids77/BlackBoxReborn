@@ -281,6 +281,16 @@ public class IPackageManagerProxy extends BinderInvocationStub {
 
         @Override
         protected Object hook(Object who, Method method, Object[] args) throws Throwable {
+            // Fix 9: Android 17 (API 37) changed some IPackageManager list-returning
+            // methods away from ParceledListSlice (e.g. AppInfoList for this call).
+            // method.getReturnType() reflects the real, running OS's actual AIDL
+            // signature, so use that instead of hardcoding an SDK_INT check — if it
+            // no longer matches ParceledListSlice, let the real PM's Binder proxy
+            // marshal whatever type this OS now expects instead of wrapping our
+            // virtualized list in the (now wrong) type and hitting a ClassCastException.
+            if (!ParceledListSliceCompat.isReturnParceledListSlice(method)) {
+                return method.invoke(who, args);
+            }
             int flags = MethodParameterUtils.toInt(args[0]);
             List<ApplicationInfo> installedApplications = BlackBoxCore.getBPackageManager().getInstalledApplications(flags, BlackBoxCore.getUserId());
             return ParceledListSliceCompat.create(installedApplications);
@@ -292,6 +302,18 @@ public class IPackageManagerProxy extends BinderInvocationStub {
 
         @Override
         protected Object hook(Object who, Method method, Object[] args) throws Throwable {
+            // Fix 9: Android 17 (API 37) changed IPackageManager.getInstalledPackages()
+            // to return PackageInfoList instead of ParceledListSlice. Wrapping our
+            // virtualized list in the old type threw:
+            //   ClassCastException: Couldn't convert result of type
+            //   android.content.pm.ParceledListSlice to android.content.pm.PackageInfoList
+            // on every Play Store launch. method.getReturnType() reflects the real,
+            // running OS's actual AIDL signature, so check that instead of hardcoding
+            // an SDK_INT branch — if it no longer matches ParceledListSlice, let the
+            // real PM's Binder proxy marshal whatever type this OS now expects.
+            if (!ParceledListSliceCompat.isReturnParceledListSlice(method)) {
+                return method.invoke(who, args);
+            }
             int flags = MethodParameterUtils.toInt(args[0]);
             List<PackageInfo> installedPackages = BlackBoxCore.getBPackageManager().getInstalledPackages(flags, BlackBoxCore.getUserId());
             return ParceledListSliceCompat.create(installedPackages);
@@ -323,6 +345,13 @@ public class IPackageManagerProxy extends BinderInvocationStub {
     public static class QueryContentProviders extends MethodHook {
         @Override
         protected Object hook(Object who, Method method, Object[] args) throws Throwable {
+            // Fix 9 (preventive, same pattern as getInstalledPackages — not confirmed
+            // to have crashed on device, but this method returns ParceledListSlice
+            // through the same reflection path, so it's exposed to the same API 37
+            // return-type migration risk).
+            if (!ParceledListSliceCompat.isReturnParceledListSlice(method)) {
+                return method.invoke(who, args);
+            }
             int flags = MethodParameterUtils.toInt(args[2]);
             List<ProviderInfo> providers = BlackBoxCore.getBPackageManager().
                     queryContentProviders(BlackBoxCore.getAppProcessName(), BlackBoxCore.getBUid(), flags, BlackBoxCore.getUserId());
@@ -340,12 +369,17 @@ public class IPackageManagerProxy extends BinderInvocationStub {
             List<ResolveInfo> resolves = BlackBoxCore.getBPackageManager().queryBroadcastReceivers(intent, flags, type, BActivityThread.getUserId());
             Slog.d(TAG, "queryIntentReceivers: " + resolves);
 
-            
             if (BuildCompat.isN()) {
+                // Fix 9 (preventive, same pattern as getInstalledPackages): only wrap
+                // in ParceledListSlice if that's still what this OS's real
+                // queryIntentReceivers() actually returns.
+                if (!ParceledListSliceCompat.isReturnParceledListSlice(method)) {
+                    return method.invoke(who, args);
+                }
                 return ParceledListSliceCompat.create(resolves);
             }
 
-            
+
             return resolves;
         }
     }
@@ -401,7 +435,11 @@ public class IPackageManagerProxy extends BinderInvocationStub {
     public static class GetSharedLibraries extends MethodHook {
         @Override
         protected Object hook(Object who, Method method, Object[] args) throws Throwable {
-            
+            // Fix 9 (preventive, same pattern as getInstalledPackages — not confirmed
+            // to have crashed on device).
+            if (!ParceledListSliceCompat.isReturnParceledListSlice(method)) {
+                return method.invoke(who, args);
+            }
             return ParceledListSliceCompat.create(new ArrayList<>());
         }
     }
