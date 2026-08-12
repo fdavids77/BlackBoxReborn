@@ -125,16 +125,19 @@ public class ProxyVpnService extends VpnService {
             
             
             builder.setSession("BlackBox VPN");
-            
-            
-            builder.addAddress("10.0.0.2", 32);
-            
-            
-            builder.addRoute("0.0.0.0", 0);  
-            
-            
+
+            // Fix 7: The original implementation routed ALL traffic (0.0.0.0/0) into the
+            // tun interface, then never processed it — silently dropping all network calls
+            // from virtual apps (DNS failures, no companion link QR, etc.).
+            //
+            // BlackBox's VPN is established solely for VPN permission / protect() capability,
+            // not to process packets. Use a loopback-only route so no real internet traffic
+            // is intercepted. Virtual app network calls flow through the normal stack.
+            builder.addAddress("10.88.0.2", 32);
+            builder.addRoute("10.88.0.0", 24);   // only route our private VPN subnet
+
+            // DNS servers for the VPN subnet only (harmless — no real DNS queries routed here)
             builder.addDnsServer("8.8.8.8");
-            builder.addDnsServer("8.8.4.4");
             
             
             builder.addAllowedApplication(getPackageName());
