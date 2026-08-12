@@ -39,8 +39,9 @@ jobs:
 
       - name: Rename APK
         run: |
-          mv app/build/outputs/apk/release/app-release.apk \
-             app/build/outputs/apk/release/BlackBoxReborn-${{ steps.version.outputs.VERSION }}.apk
+          APK=$(find app/build/outputs/apk/release/ -name "*.apk" | head -1)
+          echo "Found APK: $APK"
+          mv "$APK" app/build/outputs/apk/release/BlackBoxReborn-${{ steps.version.outputs.VERSION }}.apk
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
@@ -51,3 +52,4 @@ jobs:
 
             **Fixes included:** PackageParserFix · ArtMethodFix · GMS signature passthrough · NativeCore UID spoof
           files: app/build/outputs/apk/release/BlackBoxReborn-${{ steps.version.outputs.VERSION }}.apk
+
