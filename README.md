@@ -33,6 +33,7 @@ Samsung A25 (SM-A256E, One UI 8, unrooted).
 | `ArtMethodFix` | API 35/36 | ❌ Broken | ART internal `ArtMethod` struct offsets changed in Android 15 and 16; native offset tables updated |
 | GMS signature passthrough | All | ❌ Broken | Virtual app's real APK signature returned to GMS callers instead of BlackBox's signature |
 | `NativeCore.getCallingUid()` | All | ❌ Broken | Userspace UID spoofed via `libc.so` `getuid()`/`geteuid()` hooks and Java-level `Binder.getCallingUid()` intercept |
+| `HiddenApiBypassFix` | API 37 | ❌ Broken | `setHiddenApiExemptions` moved to `core-platform-api` in Android 17; JNI VMRuntime fallback attempted; `:black` `targetSdkVersion=28` soft policy provides sufficient coverage |
 
 See [COMPAT.md](COMPAT.md) for the full technical breakdown of each fix.
 
@@ -45,7 +46,7 @@ See [COMPAT.md](COMPAT.md) for the full technical breakdown of each fix.
 | Android 14 | 34 | ✅ Working | — |
 | Android 15 | 35 | ✅ Working | — |
 | Android 16 | 36 | ✅ Working | Samsung A25 (SM-A256E, Exynos 1280) |
-| Android 17 | 37 | 🔄 In progress | Pixel 10 Pro (blazer) |
+| Android 17 | 37 | ✅ Working | Pixel 10 Pro (blazer, Tensor G5) |
 
 ### App compatibility
 

@@ -45,36 +45,49 @@ bool disable_hidden_api(JNIEnv *env) {
     }
 
     delete elf_img;
-    
-    if (!addr) {
-        ALOGE("HiddenAPI: Didn't find setHiddenApiExemptions in any form");
-        return false;
-    }
 
     jclass stringClass = env->FindClass("java/lang/String");
     if (!stringClass) {
         ALOGE("HiddenAPI: Failed to find String class");
         return false;
     }
-
-    
     jstring wildcard = env->NewStringUTF("L");
-    if (!wildcard) {
-        ALOGE("HiddenAPI: Failed to create wildcard string");
-        return false;
-    }
-
     jobjectArray args = env->NewObjectArray(1, stringClass, wildcard);
-    if (!args) {
-        ALOGE("HiddenAPI: Failed to create args array");
-        return false;
+
+    if (addr) {
+        auto func = reinterpret_cast<void (*)(JNIEnv *, jclass, jobjectArray)>(addr);
+        func(env, stringClass, args);
+        ALOGD("HiddenAPI: Successfully disabled hidden API restrictions via native symbol");
+        return true;
     }
 
-    auto func = reinterpret_cast<void (*)(JNIEnv *, jclass, jobjectArray)>(addr);
-    
-    func(env, stringClass, args);
-    ALOGD("HiddenAPI: Successfully disabled hidden API restrictions");
-    return true;
+    // Fix 5 (API 37+): native symbol removed from libart.so in Android 17.
+    // Fall back to JNI method lookup on VMRuntime — accessible from :black
+    // process (targetSdkVersion=28) even when the native export is stripped.
+    ALOGD("HiddenAPI: Trying JNI VMRuntime fallback for API 37+");
+    jclass vmRuntimeClass = env->FindClass("dalvik/system/VMRuntime");
+    if (vmRuntimeClass) {
+        jmethodID getRuntimeId = env->GetStaticMethodID(
+            vmRuntimeClass, "getRuntime", "()Ldalvik/system/VMRuntime;");
+        if (getRuntimeId) {
+            jobject vmRuntime = env->CallStaticObjectMethod(vmRuntimeClass, getRuntimeId);
+            if (vmRuntime && !env->ExceptionCheck()) {
+                jmethodID setExemptionsId = env->GetMethodID(
+                    vmRuntimeClass, "setHiddenApiExemptions", "([Ljava/lang/String;)V");
+                if (setExemptionsId) {
+                    env->CallVoidMethod(vmRuntime, setExemptionsId, args);
+                    if (!env->ExceptionCheck()) {
+                        ALOGD("HiddenAPI: Successfully disabled via JNI VMRuntime fallback");
+                        return true;
+                    }
+                    env->ExceptionClear();
+                } else { env->ExceptionClear(); }
+            } else { env->ExceptionClear(); }
+        } else { env->ExceptionClear(); }
+    } else { env->ExceptionClear(); }
+
+    ALOGE("HiddenAPI: All bypass methods exhausted on API %ld — :black soft policy still active", android_version);
+    return false;
 }
 
 bool disable_resource_loading() {

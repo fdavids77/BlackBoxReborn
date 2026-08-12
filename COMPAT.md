@@ -435,8 +435,96 @@ All four fixes were validated on:
 
 If you're hitting a new breakage on Android 17+ (API 37+):
 
-1. Identify which of the four categories the break falls into (parser, ART offsets, signature, UID)
+1. Identify which of the five categories the break falls into (parser, ART offsets, signature, UID, hidden API)
 2. Check logcat for the specific exception or SIGSEGV address
 3. For ART offset issues: use `tools/art_offset_verifier/` to measure the new offsets
 4. Open an issue using the [compat bug template](.github/ISSUE_TEMPLATE/compat_bug.yml) with your findings
 5. PR the fix with a new row in the testing table above
+
+---
+
+## Fix 5 — HiddenApiBypassFix (API 37)
+
+### What broke
+
+BlackBox bypasses Android's hidden API restrictions by calling
+`VMRuntime.setHiddenApiExemptions(new String[]{"L"})` — a wildcard that grants
+unrestricted access to all internal Android APIs via reflection. The native implementation
+looked up the C++ symbol `_ZN3art9VMRuntime22setHiddenApiExemptionsEP7_JNIEnvP7_jclassP13_jobjectArray`
+in `libart.so` directly.
+
+In Android 17 (API 37), Google reclassified `setHiddenApiExemptions` from `@hide` to
+`core-platform-api`. This means the method is now only accessible to platform-signed
+system apps — it is completely blocked from all third-party apps regardless of
+`targetSdkVersion`.
+
+### Error you saw
+
+```
+E NativeCore: HiddenAPI: Didn't find setHiddenApiExemptions in any form
+D NativeCore: set disableHiddenApi Fail!!!
+```
+
+After adding the JNI VMRuntime fallback in Fix 5:
+
+```
+D NativeCore: HiddenAPI: Trying JNI VMRuntime fallback for API 37+
+E .blackbox:black: hiddenapi: Accessing hidden method
+  Ldalvik/system/VMRuntime;->setHiddenApiExemptions([Ljava/lang/String;)V
+  (runtime_flags=CorePlatformApi, domain=core-platform, api=blocked,core-platform-api)
+  from Ltop/niunaijun/blackbox/BlackBoxCore; (domain=app, TargetSdkVersion=28)
+  using JNI: denied
+E NativeCore: HiddenAPI: All bypass methods exhausted on API 37 — :black soft policy still active
+```
+
+### Why it is non-fatal
+
+The blanket exemption was belt-and-suspenders. The `:black` server process already runs
+with `targetSdkVersion=28` (set in its `AndroidManifest.xml`). Android enforces a
+significantly softer hidden API policy for apps targeting API 28 — accesses to
+`unsupported` hidden APIs are logged as warnings but **allowed**:
+
+```
+I .blackbox:black: hiddenapi: Accessing hidden method
+  Landroid/app/ActivityThread;->currentActivityThread()...
+  (runtime_flags=0, domain=platform, api=unsupported)
+  using reflection: allowed
+```
+
+All of the hidden APIs BlackBox actually needs (ActivityThread, ServiceManager,
+PackageParser internals, Instrumentation hooks) are in the `unsupported` domain and
+remain accessible via the `targetSdkVersion=28` soft policy even without the blanket
+exemption. Full service initialisation was confirmed on Android 17.
+
+### The fix — graceful fallback chain in hidden_api.cpp
+
+The code now attempts three paths in sequence and fails gracefully rather than hard-stopping:
+
+1. **Native symbol lookup** — tries three C++ mangled names for `setHiddenApiExemptions`
+   in `libart.so`. Works on Android 10–16.
+2. **JNI VMRuntime fallback** — calls `VMRuntime.getRuntime().setHiddenApiExemptions()`
+   via `GetMethodID`/`CallVoidMethod`. Attempted on API 37+; denied by `core-platform-api`
+   restriction but tried before giving up.
+3. **Soft policy** — falls through to the `:black targetSdkVersion=28` natural soft
+   enforcement, which covers all the hidden APIs BlackBox requires.
+
+### There is no userspace fix for the core-platform-api restriction
+
+Accessing a `core-platform-api` method from a third-party app on Android 17 requires:
+- Being signed with the platform signing key, OR
+- Running as a system app in `/system/priv-app/`, OR
+- Having kernel root to modify the process's SELinux context
+
+None of these are available to a standard BlackBox install. The soft policy path is the
+correct long-term answer for unprivileged installs.
+
+### Files changed
+
+- `Bcore/src/main/cpp/hidden_api.cpp` — JNI VMRuntime fallback added after native
+  symbol search; graceful failure message updated to clarify soft policy coverage
+
+### Testing notes
+
+| Device | Android | API | Root | `setHiddenApiExemptions` | App functional |
+|--------|---------|-----|------|--------------------------|----------------|
+| Pixel 10 Pro (blazer) | 17 | 37 | Yes | ❌ blocked (core-platform-api) | ✅ Yes — soft policy covers all needed APIs |
