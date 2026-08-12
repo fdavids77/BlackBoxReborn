@@ -128,8 +128,20 @@ public class IPackageManagerProxy extends BinderInvocationStub {
 
     @ProxyMethod("getPackageInfo")
     public static class GetPackageInfo extends MethodHook {
+        // Fix 6 (API 37): PropertyInvalidatedCache.query() now calls Binder.getCallingUid()
+        // internally, and our getCallingUid hook calls getPackageInfo(), creating infinite
+        // recursion. This guard detects re-entry and falls through to the real IPackageManager
+        // (method.invoke) instead of re-entering our hook logic.
+        private static final ThreadLocal<Boolean> sInHook = new ThreadLocal<>();
+
         @Override
         protected Object hook(Object who, Method method, Object[] args) throws Throwable {
+            // Re-entrancy guard: if already inside this hook on this thread, call real PM directly
+            if (Boolean.TRUE.equals(sInHook.get())) {
+                return method.invoke(who, args);
+            }
+            sInHook.set(true);
+            try {
             String packageName = (String) args[0];
             int flags = MethodParameterUtils.toInt(args[1]);
             
@@ -167,8 +179,11 @@ public class IPackageManagerProxy extends BinderInvocationStub {
                 return method.invoke(who, args);
             }
             return null;
+            } finally {
+                sInHook.set(false);
+            }
         }
-        
+
         private PackageInfo createFakeGooglePlayServicesPackageInfo() {
             PackageInfo packageInfo = new PackageInfo();
             packageInfo.packageName = "com.android.vending";

@@ -24,6 +24,9 @@ public class NativeCore {
     /** Real system UID of the currently-running virtual app, cached before PM hooks fire. */
     private static volatile int sCachedRealUid = -1;
     private static volatile String sCachedRealUidPkg = null;
+    // Re-entrancy guard for getCallingUid — prevents StackOverflowError on API 37
+    // where PropertyInvalidatedCache calls Binder.getCallingUid() inside cache queries.
+    private static final ThreadLocal<Boolean> sReentrantGuard = new ThreadLocal<>();
 
     /**
      * Called from BlackBoxLoader.beforeCreateApplication() BEFORE any PM proxy hooks fire.
@@ -96,6 +99,15 @@ public class NativeCore {
 
     @Keep
     public static int getCallingUid(int origCallingUid) {
+        // Fix 6 (API 37): Android 17 changed PropertyInvalidatedCache to call
+        // Binder.getCallingUid() from inside cache queries. Since we hook
+        // getCallingUid() and call back into getPackageInfo() (which uses the
+        // cache), this creates an infinite recursion → StackOverflowError.
+        // Guard with a ThreadLocal re-entrancy flag to break the cycle.
+        if (Boolean.TRUE.equals(sReentrantGuard.get())) {
+            return origCallingUid;
+        }
+        sReentrantGuard.set(true);
         try {
             
             if (origCallingUid > 0 && origCallingUid < Process.FIRST_APPLICATION_UID)
@@ -134,8 +146,9 @@ public class NativeCore {
             return origCallingUid;
         } catch (Exception e) {
             Log.e(TAG, "Error in getCallingUid: " + e.getMessage());
-            
             return Process.myUid();
+        } finally {
+            sReentrantGuard.set(false);
         }
     }
 
