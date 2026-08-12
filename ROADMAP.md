@@ -12,11 +12,11 @@ upstream fixes properly documented and CI-verified.
 - [x] GMS real signature passthrough
 - [x] `NativeCore.getCallingUid()` userspace UID spoof
 - [x] Tested on Samsung A25 (SM-A256E, API 36, unrooted)
-- [x] COMPAT.md documentation for all four fixes
-- [ ] GitHub Actions CI (build on push, artifact upload)
-- [ ] App compat matrix (WhatsApp, Telegram, Instagram baseline)
-- [ ] `tools/art_offset_verifier/` — ART offset measurement utility
-- [ ] Android 17 (API 37) compatibility pass
+- [x] COMPAT.md documentation for all five fixes (including Fix 5 API 37)
+- [x] GitHub Actions CI (build on push, artifact upload)
+- [x] App compat matrix baseline (WhatsApp on API 36/37)
+- [x] `tools/art_offset_verifier/` — ART offset measurement utility (ArtOffsetVerifierTest)
+- [x] Android 17 (API 37) compatibility pass — confirmed on Pixel 10 Pro
 
 ---
 
@@ -25,50 +25,69 @@ upstream fixes properly documented and CI-verified.
 **Goal:** Solve the companion link / Noise Protocol handshake failure. This requires
 kernel-level UID assignment for the container process.
 
-### Background
+### Research status: PATH A VALIDATED ✅
 
-The current userspace UID spoof (Fix 4) patches `getuid()` and `Binder.getCallingUid()`
-in userspace. This is sufficient for most IPC scenarios but fails for kernel socket
-credentials (`SO_PEERCRED`). WhatsApp's companion link handshake and Telegram's QR login
-both verify the connecting process's UID via the kernel socket credential mechanism.
+PoC (`tools/m2-uid-poc/uid_poc_v2.c`) confirmed on Pixel 10 Pro (blazer, Android 17,
+Magisk root):
 
-### Research paths
+```
+[child]  before setresuid: uid=0
+[child]  after  setresuid: uid=10326
+[child]  connected as uid=10326
+[parent] SO_PEERCRED uid = 10326
+RESULT: ✅ SO_PEERCRED uid = 10326
+        setresuid() → connect() → SO_PEERCRED WORKS
+        Companion link UID fix is VALID on this SoC
+```
 
-**Path A — Root-based UID namespace (near-term, requires kernel root)**
+`setresuid(target_uid)` from a root context, followed by `connect()`, correctly
+produces a socket credential that the peer reads as `target_uid` via `SO_PEERCRED`.
+This is the key validation — the WhatsApp companion link server checks the connecting
+process's UID, and it will see the correct value.
 
-On a rooted device, Linux user namespaces (`clone(CLONE_NEWUSER)`) can remap UIDs.
-If the container process enters a new user namespace where virtual UID `10326` maps to
-real UID `10299`, the kernel socket credential will show `10326` to the peer.
+### Implementation approach (rooted devices)
 
-Requirements:
-- Kernel root (or `CAP_SYS_ADMIN` in the init namespace)
-- `CONFIG_USER_NS=y` in the kernel config (most modern Android kernels have this)
-- `unshare(CLONE_NEWUSER)` + write `/proc/self/uid_map`
+A Magisk service running as root watches for the BlackBox virtual WhatsApp process.
+When the companion link flow is detected (process reaches `RegisterAsCompanionActivity`),
+a root helper:
 
-This path is testable on the Pixel 10 Pro (rooted) today.
+1. Gets the virtual WhatsApp PID from BlackBox
+2. Uses `ptrace` to inject a `setresuid(real_wa_uid)` syscall into the target process
+3. After the ptrace injection, all new socket connections from that process carry the
+   correct UID in `SO_PEERCRED`
+4. Companion link handshake sees the correct identity and proceeds
 
-**Path B — CVE-2026-43499 kernel exploit on A25 (medium-term)**
-
-The Samsung A25 (SM-A256E, kernel 5.10.240, May 2026 patch level) is confirmed vulnerable
-to CVE-2026-43499. The June 2026 patch closes the window. A kernel exploit on the a25x
-(Exynos 1280) target would provide `CAP_SYS_ADMIN` / root context from which Path A
-becomes available on an unrooted device.
-
-Status: No a25x-specific port exists yet. Tracking at Root My Galaxy.
-
-**Path C — Kernel module / eBPF hook (long-term)**
-
-On rooted devices with `CONFIG_BPF_SYSCALL`, an eBPF program attached to the socket layer
-could intercept `SO_PEERCRED` reads and substitute the virtual UID. This would not require
-a kernel exploit but does require root to load the eBPF program.
+Alternative (simpler, same result): the root helper forks a proxy process that runs
+as the correct UID and handles the companion link socket connection, transparently
+bridging to the virtual WhatsApp.
 
 ### Milestone 2 deliverables
 
-- [ ] UID namespace proof-of-concept on Pixel 10 Pro (rooted, Android 17)
-- [ ] WhatsApp companion link confirmed working via namespace path
-- [ ] Document namespace setup in COMPAT.md
-- [ ] Investigate eBPF `SO_PEERCRED` hook feasibility
-- [ ] a25x CVE port (tracked externally — see PrivilegeKit repo)
+- [x] PoC binary (`uid_poc_v2`) confirming `setresuid → SO_PEERCRED` works
+- [ ] ptrace UID injector — inject `setresuid()` into a running process from root
+- [ ] Integration with BlackBox — detect companion link attempt, trigger injection
+- [ ] WhatsApp companion link confirmed working end-to-end on Pixel 10 Pro
+- [ ] Magisk module packaging for the root helper service
+- [ ] Document UID namespace approach as alternative for kernel-exploit path (A25)
+
+### Research paths
+
+**Path A — Root-based setresuid (confirmed working ✅)**
+
+Requires Magisk or equivalent root on the device. Works today on any rooted device.
+Validated by `uid_poc_v2.c` on Pixel 10 Pro (blazer, Android 17, kernel 6.6.118).
+
+**Path B — CVE-2026-43499 kernel exploit on A25 (blocked pending port)**
+
+The Samsung A25 (SM-A256E, kernel 5.10.240, May 2026 patch) is confirmed vulnerable.
+No a25x (Exynos 1280) port exists yet. Once a port lands, Path A applies to the A25.
+Tracking at Root My Galaxy.
+
+**Path C — Kernel module / eBPF hook (long-term, rooted only)**
+
+On rooted devices with `CONFIG_BPF_SYSCALL`, an eBPF program attached to the socket
+layer could intercept `SO_PEERCRED` reads. Same root requirement as Path A but more
+surgical — no process injection needed.
 
 ---
 
