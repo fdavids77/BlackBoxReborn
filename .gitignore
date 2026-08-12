@@ -22,3 +22,8 @@
 .cxx
 local.properties
 /app/release/
+
+*.jks
+*.keystore
+/apk/
+*.apk
