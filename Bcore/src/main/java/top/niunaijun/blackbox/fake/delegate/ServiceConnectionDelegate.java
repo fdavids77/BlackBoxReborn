@@ -73,7 +73,13 @@ public class ServiceConnectionDelegate extends IServiceConnection.Stub {
         if (Build.VERSION.SDK_INT >= 37
                 && code == android.os.IBinder.FIRST_CALL_TRANSACTION) {
             data.enforceInterface(DESCRIPTOR);
-            ComponentName name = ComponentName.CREATOR.createFromParcel(data);
+            // AIDL always precedes a nullable Parcelable arg with a presence flag
+            // (readInt() != 0) before the actual writeToParcel payload — must be
+            // consumed first or every subsequent read is off by 4 bytes.
+            ComponentName name = null;
+            if (data.readInt() != 0) {
+                name = ComponentName.CREATOR.createFromParcel(data);
+            }
             IBinder service = data.readStrongBinder();
             // Read and discard IBinderSession (it extends IBinder internally)
             if (data.dataAvail() > 4) { // more than a boolean left → session IBinder present
