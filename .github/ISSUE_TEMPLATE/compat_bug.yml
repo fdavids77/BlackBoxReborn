@@ -1,0 +1,55 @@
+﻿name: API compatibility bug
+description: Report a crash or breakage on a specific Android version or device
+title: "[COMPAT] "
+labels: ["compat", "needs-triage"]
+body:
+  - type: input
+    id: android_version
+    attributes:
+      label: Android version
+      placeholder: Android XX (API XX)
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      placeholder: e.g. Samsung A25 (SM-A256E, Exynos 1280)
+    validations:
+      required: true
+  - type: dropdown
+    id: rooted
+    attributes:
+      label: Is the device rooted?
+      options:
+        - "No — stock/locked"
+        - "Yes — Magisk"
+        - "Yes — KernelSU"
+        - "Yes — other"
+    validations:
+      required: true
+  - type: dropdown
+    id: fix_category
+    attributes:
+      label: Which fix category does this affect?
+      options:
+        - PackageParserFix (APK parsing / virtual install crash)
+        - ArtMethodFix (hooks not applying / SIGSEGV)
+        - GMS signature passthrough (GMS / Firebase / WhatsApp init failure)
+        - NativeCore UID spoof (wrong UID returned / IPC trust failure)
+        - Unknown / new category
+    validations:
+      required: true
+  - type: textarea
+    id: error
+    attributes:
+      label: Error / logcat output
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true

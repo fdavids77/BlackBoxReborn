@@ -1,0 +1,106 @@
+plugins {
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.jetbrains.kotlin.android)
+}
+
+android {
+
+    namespace 'top.niunaijun.blackboxa'
+    compileSdk rootProject.ext.compileSdkVersion
+    buildToolsVersion "36.1.0"
+    ndkVersion = "27.0.12077973"
+    defaultConfig {
+        applicationId "top.niunaijun.blackbox"
+        minSdk rootProject.ext.minSdk
+        targetSdk rootProject.ext.targetSdkVersion
+        versionCode rootProject.ext.versionCode
+        versionName rootProject.ext.versionName
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+
+        splits {
+            abi {
+                enable true
+                reset()
+                
+                include 'armeabi-v7a', "arm64-v8a"
+                universalApk true
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            signingConfig signingConfigs.debug
+            minifyEnabled true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    buildFeatures {
+        viewBinding true
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+    packaging {
+        jniLibs {
+            excludes.add("**/libandroidx.graphics.path.so")
+        }
+        resources {
+            excludes.add("**/libandroidx.graphics.path.so")
+        }
+    }
+    applicationVariants.configureEach { variant ->
+        variant.outputs.configureEach { output ->
+            output.outputFileName = "BlackBox_${variant.versionName}_${output.baseName}.apk"
+        }
+    }
+}
+
+dependencies {
+    implementation fileTree(dir: "libs", include: ["*.jar", "*.aar"])
+    implementation project(':Bcore')
+
+    implementation libs.appcompat
+    implementation libs.material
+    implementation libs.constraintlayout
+    implementation libs.core.ktx
+    testImplementation libs.junit
+    androidTestImplementation libs.ext.junit
+    androidTestImplementation libs.espresso.core
+
+    implementation "androidx.preference:preference-ktx:1.1.1"
+    
+    implementation "androidx.lifecycle:lifecycle-viewmodel-ktx:2.3.1"
+    implementation "androidx.lifecycle:lifecycle-livedata-ktx:2.3.1"
+    implementation "androidx.lifecycle:lifecycle-runtime-ktx:2.3.1"
+
+    
+    implementation 'androidx.recyclerview:recyclerview:1.2.1'
+    implementation 'com.gitee.cbfg5210:RVAdapter:0.3.7'
+
+    
+    implementation 'com.github.Othershe:CornerLabelView:1.0.0'
+    
+    // StateView bundled in app/libs/StateView-v3.0.6.aar
+    
+    implementation 'com.github.Ferfalk:SimpleSearchView:0.2.0'
+    implementation 'com.tbuonomo:dotsindicator:4.2'
+    
+    implementation 'org.osmdroid:osmdroid-android:6.1.11'
+    
+    implementation 'com.afollestad.material-dialogs:core:3.3.0'
+    implementation 'com.afollestad.material-dialogs:input:3.3.0'
+
+
+
+
+
+    
+    implementation 'androidx.work:work-runtime:2.7.1'
+
+}
