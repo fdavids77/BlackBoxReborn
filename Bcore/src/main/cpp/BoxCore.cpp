@@ -131,13 +131,52 @@ bool disableResourceLoading(JNIEnv *env, jclass clazz) {
     return true;
 }
 
+// ART Offset Verifier — returns the raw ArtMethod* for a java.lang.reflect.Method.
+//
+// NOTE: FromReflectedMethod() returns an ENCODED jmethodID in modern ART (API 31+),
+// not a raw ArtMethod* pointer. The real pointer is stored in the `artMethod` long
+// field of java.lang.reflect.Executable. This is the same approach used by LSPosed,
+// SandHook, and every serious ART hooking framework.
+static jlong getArtMethodPtr(JNIEnv *env, jclass, jobject method) {
+    if (method == nullptr) return 0;
+
+    // Try java.lang.reflect.Executable.artMethod (API 26+)
+    jclass executableClass = env->FindClass("java/lang/reflect/Executable");
+    if (!executableClass) { env->ExceptionClear(); }
+
+    // Fallback: java.lang.reflect.AbstractMethod (API < 26)
+    if (!executableClass) {
+        executableClass = env->FindClass("java/lang/reflect/AbstractMethod");
+        if (!executableClass) { env->ExceptionClear(); return 0; }
+    }
+
+    jfieldID artMethodField = env->GetFieldID(executableClass, "artMethod", "J");
+    if (!artMethodField) {
+        env->ExceptionClear();
+        ALOGE("getArtMethodPtr: artMethod field not found");
+        return 0;
+    }
+
+    return env->GetLongField(method, artMethodField);
+}
+
+// ART Offset Verifier — reads 4 raw bytes from a native address.
+// Used to scan ArtMethod fields and locate access_flags / dex_code_item_offset.
+// Only called with pointers obtained from getArtMethodPtr — not arbitrary memory.
+static jint readNativeInt(JNIEnv *env, jclass, jlong address) {
+    if (address == 0) return 0;
+    return *reinterpret_cast<jint *>(address);
+}
+
 static JNINativeMethod gMethods[] = {
-        {"disableHiddenApi", "()Z",                               (void *) disableHiddenApi},
-        {"disableResourceLoading", "()Z",                         (void *) disableResourceLoading},
-        {"hideXposed", "()V",                                     (void *) hideXposed},
-        {"addIORule",  "(Ljava/lang/String;Ljava/lang/String;)V", (void *) addIORule},
-        {"enableIO",   "()V",                                     (void *) enableIO},
-        {"init",       "(I)V",                                    (void *) init},
+        {"disableHiddenApi",    "()Z",                               (void *) disableHiddenApi},
+        {"disableResourceLoading", "()Z",                            (void *) disableResourceLoading},
+        {"hideXposed",          "()V",                               (void *) hideXposed},
+        {"addIORule",           "(Ljava/lang/String;Ljava/lang/String;)V", (void *) addIORule},
+        {"enableIO",            "()V",                               (void *) enableIO},
+        {"init",                "(I)V",                              (void *) init},
+        {"getArtMethodPtr",     "(Ljava/lang/reflect/Method;)J",     (void *) getArtMethodPtr},
+        {"readNativeInt",       "(J)I",                              (void *) readNativeInt},
 };
 
 int registerNativeMethods(JNIEnv *env, const char *className,

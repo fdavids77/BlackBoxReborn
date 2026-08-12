@@ -9,7 +9,7 @@ ext {
     compileSdkVersion = 36
     targetSdkVersion = 28  // Keep 28 intentionally — gives broader API access
 
-    minSdk = 21
+    minSdk = 24  // Android 7.0 — min for test APK install; BlackBox Reborn targets API 34+
     versionCode = 400
     versionName = "4.0.0"
     xVersion = '1.1.0'

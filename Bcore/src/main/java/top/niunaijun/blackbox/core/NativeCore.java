@@ -86,8 +86,12 @@ public class NativeCore {
     public static native void hideXposed();
 
     public static native boolean disableHiddenApi();
-    
+
     public static native boolean disableResourceLoading();
+
+    // ART Offset Verifier tools — see tools/art-offset-verifier/
+    public static native long getArtMethodPtr(java.lang.reflect.Method method);
+    public static native int readNativeInt(long address);
 
 
     @Keep
