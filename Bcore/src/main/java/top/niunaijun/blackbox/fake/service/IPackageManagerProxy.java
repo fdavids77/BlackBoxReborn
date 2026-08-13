@@ -158,6 +158,36 @@ public class IPackageManagerProxy extends BinderInvocationStub {
                 // Fallback fake if GMS not on system
                 return createFakeGooglePlayServicesPackageInfo();
             }
+
+            // Phase 2A: Signature/cert passthrough for virtual app self-queries.
+            // Problem: libwhatsapp.so calls getPackageName() → gets "top.niunaijun.blackbox"
+            // (the host process), then calls getPackageInfo(host, GET_SIGNING_CERTIFICATES)
+            // → receives BlackBox's debug cert → produces a bad registration token → parole block.
+            // Fix: intercept any signature-flag query and route it to the real system PM.
+            // If the queried package is the BlackBox host but caller is a virtual app,
+            // substitute the virtual app's actual package so Meta's cert is returned.
+            final int GET_SIGNING_CERTIFICATES = 0x8000000;
+            boolean wantsSignature = (flags & PackageManager.GET_SIGNATURES) != 0
+                    || (flags & GET_SIGNING_CERTIFICATES) != 0;
+            if (wantsSignature) {
+                String realPkg = packageName;
+                if (BlackBoxCore.getHostPkg().equals(packageName)) {
+                    String virtualPkg = BActivityThread.getAppPackageName();
+                    if (virtualPkg != null && !BlackBoxCore.getHostPkg().equals(virtualPkg)) {
+                        realPkg = virtualPkg;
+                        Slog.d(TAG, "Phase 2A: Redirecting signature query "
+                                + packageName + " → " + realPkg);
+                    }
+                }
+                try {
+                    PackageInfo realInfo = BlackBoxCore.getContext()
+                            .getPackageManager().getPackageInfo(realPkg, flags);
+                    if (realInfo != null) {
+                        Slog.d(TAG, "Phase 2A: Returning real system cert for " + realPkg);
+                        return realInfo;
+                    }
+                } catch (Exception ignored) {}
+            }
             
             PackageInfo packageInfo = BlackBoxCore.getBPackageManager().getPackageInfo(packageName, flags, BlackBoxCore.getUserId());
             if (packageInfo != null) {
