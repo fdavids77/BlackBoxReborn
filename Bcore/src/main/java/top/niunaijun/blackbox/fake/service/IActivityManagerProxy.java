@@ -344,12 +344,12 @@ public class IActivityManagerProxy extends ClassInvocationStub {
             String resolvedType = (String) args[3];
             IServiceConnection connection = (IServiceConnection) args[4];
 
-            // Fix 10: Block Play Integrity / ExpressIntegrity service bindings from virtual apps.
-            // When WhatsApp calls StandardIntegrityManager.requestIntegrityToken(), Play Core SDK
-            // binds to com.google.android.finsky.expressintegrityservice.ExpressIntegrityService.
-            // GMS then generates a token signed for 'top.niunaijun.blackbox' (not 'com.whatsapp').
-            // WhatsApp's server rejects it → "Download the official WhatsApp" (CustomRegistrationBlockActivity).
-            // Returning 0 (bind failed) forces WhatsApp onto its GMS-unavailable fallback path.
+            // Fix 10: Suppress Play Integrity ExpressIntegrityService bindings.
+            // NOTE: Temporarily disabled — suppressing Play Integrity prevents WhatsApp from
+            // including any integrity token in the registration payload, causing the server
+            // to return parole at stage 2 (inside VerifyPhoneNumber flow).
+            // Testing whether providing a token (even for the wrong package) is better than no token.
+            /*
             if (intent != null) {
                 ComponentName comp = intent.getComponent();
                 String action  = intent.getAction();
@@ -365,9 +365,10 @@ public class IActivityManagerProxy extends ClassInvocationStub {
                 if (isIntegrity) {
                     Slog.d(TAG, "Fix 10: Suppressing Play Integrity bind → "
                         + (comp != null ? comp.getClassName() : action));
-                    return 0; // binding failed — triggers WhatsApp's GMS-unavailable fallback
+                    return 0;
                 }
             }
+            */
 
             
             if (intent == null) {
