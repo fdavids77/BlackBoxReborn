@@ -871,7 +871,14 @@ public class BlackBoxCore extends ClientConfiguration {
             if (processName.endsWith("p0")) {
 
             }
-
+            // Phase 2: install Play Integrity token bridge for virtualised WhatsApp
+            try {
+                String virtualPkg = top.niunaijun.blackbox.app.BActivityThread.getAppPackageName();
+                if (virtualPkg != null) {
+                    top.niunaijun.blackbox.hooks.IntegrityProxy.install(
+                        context.getClassLoader(), virtualPkg);
+                }
+            } catch (Throwable ignored) {}
         }
         if (isServerProcess()) {
             if (clientConfiguration.isEnableDaemonService()) {

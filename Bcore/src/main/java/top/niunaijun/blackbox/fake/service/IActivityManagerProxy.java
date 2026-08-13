@@ -344,12 +344,11 @@ public class IActivityManagerProxy extends ClassInvocationStub {
             String resolvedType = (String) args[3];
             IServiceConnection connection = (IServiceConnection) args[4];
 
-            // Fix 10: Suppress Play Integrity ExpressIntegrityService bindings.
-            // NOTE: Temporarily disabled — suppressing Play Integrity prevents WhatsApp from
-            // including any integrity token in the registration payload, causing the server
-            // to return parole at stage 2 (inside VerifyPhoneNumber flow).
-            // Testing whether providing a token (even for the wrong package) is better than no token.
-            /*
+            // Fix 10 + Phase 2: Block Play Integrity binds from virtual apps.
+            // The virtual WhatsApp runs as top.niunaijun.blackbox so GMS generates
+            // a token for the wrong package. Phase 2 (IntegrityProxy) supplies a real
+            // com.whatsapp token via the WaEnhancer bridge in the real WhatsApp process.
+            // Blocking GMS here prevents the wrong token from overriding the bridge result.
             if (intent != null) {
                 ComponentName comp = intent.getComponent();
                 String action  = intent.getAction();
@@ -363,12 +362,11 @@ public class IActivityManagerProxy extends ClassInvocationStub {
                         action.contains("expressintegrityservice") ||
                         action.contains("IntegrityService")));
                 if (isIntegrity) {
-                    Slog.d(TAG, "Fix 10: Suppressing Play Integrity bind → "
+                    Slog.d(TAG, "Fix 10: Blocking GMS Play Integrity bind (Phase 2 bridge active) → "
                         + (comp != null ? comp.getClassName() : action));
                     return 0;
                 }
             }
-            */
 
             
             if (intent == null) {
