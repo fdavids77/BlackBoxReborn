@@ -344,11 +344,9 @@ public class IActivityManagerProxy extends ClassInvocationStub {
             String resolvedType = (String) args[3];
             IServiceConnection connection = (IServiceConnection) args[4];
 
-            // Fix 10 + Phase 2: Block Play Integrity binds from virtual apps.
-            // The virtual WhatsApp runs as top.niunaijun.blackbox so GMS generates
-            // a token for the wrong package. Phase 2 (IntegrityProxy) supplies a real
-            // com.whatsapp token via the WaEnhancer bridge in the real WhatsApp process.
-            // Blocking GMS here prevents the wrong token from overriding the bridge result.
+            // Phase 2 / Fix 10: For Play Integrity service binds, wrap the IServiceConnection
+            // so ServiceConnectionDelegate.connected() intercepts when the service connects.
+            // The wrapped connected() will proxy the IBinder to bridge nonces → WaEnhancer.
             if (intent != null) {
                 ComponentName comp = intent.getComponent();
                 String action  = intent.getAction();
@@ -361,10 +359,14 @@ public class IActivityManagerProxy extends ClassInvocationStub {
                     (action != null && (
                         action.contains("expressintegrityservice") ||
                         action.contains("IntegrityService")));
-                if (isIntegrity) {
-                    Slog.d(TAG, "Fix 10: Blocking GMS Play Integrity bind (Phase 2 bridge active) → "
-                        + (comp != null ? comp.getClassName() : action));
-                    return 0;
+                if (isIntegrity && connection != null) {
+                    Slog.d(TAG, "Phase 2: Wrapping integrity service connection for bridge");
+                    IServiceConnection proxy =
+                        top.niunaijun.blackbox.hooks.IntegrityProxy.createConnectionProxy(
+                            connection, intent);
+                    args[4] = proxy;
+                    args[callingPackageIndex] = BlackBoxCore.getHostPkg();
+                    return method.invoke(who, args);
                 }
             }
 

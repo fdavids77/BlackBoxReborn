@@ -1,39 +1,48 @@
 package top.niunaijun.blackbox.hooks;
 
+import android.app.IServiceConnection;
 import android.content.BroadcastReceiver;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.os.Build;
+import android.os.IBinder;
+import android.os.Parcel;
+import android.os.RemoteException;
 
-import java.lang.reflect.InvocationHandler;
-import java.lang.reflect.Method;
-import java.lang.reflect.Proxy;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
+import black.android.app.BRIServiceConnectionO;
 import top.niunaijun.blackbox.BlackBoxCore;
 import top.niunaijun.blackbox.utils.Slog;
+import top.niunaijun.blackbox.utils.compat.BuildCompat;
 
 /**
- * IntegrityProxy — BlackBox side of the Phase 2 Play Integrity token bridge.
+ * IntegrityProxy — Phase 2 Play Integrity token bridge (Binder-proxy approach).
  *
- * When the virtualised WhatsApp calls StandardIntegrityManager.requestIntegrityToken()
- * inside BlackBox, GMS generates a token signed for "top.niunaijun.blackbox".
- * WhatsApp's server rejects this → parole at stage 2 of registration.
+ * When the virtualised WhatsApp binds to ExpressIntegrityService, GMS generates
+ * a token for "top.niunaijun.blackbox". WhatsApp's server rejects it → parole.
  *
- * This class hooks IntegrityManagerFactory.createStandard() to return a
- * proxy manager whose requestIntegrityToken() calls the real com.whatsapp
- * (via WaEnhancer's IntegrityBridge) and returns the real token.
+ * This class:
+ * 1. Wraps the IServiceConnection in BindServiceCommon for integrity binds
+ * 2. When GMS calls connected(), wraps the service IBinder with IntegrityBinderProxy
+ * 3. Play Core calls requestExpressIntegrityToken on our proxy
+ * 4. We intercept the callback IBinder, wrapping it with IntegrityCallbackProxy
+ * 5. When GMS delivers the (wrong-package) token to our callback, we:
+ *    a. Extract the nonce from the JWT payload
+ *    b. Broadcast the nonce to WaEnhancer (IntegrityBridge in real com.whatsapp)
+ *    c. Wait up to 15s for a real com.whatsapp token
+ *    d. Replace the forwarded Parcel with the real token before calling the real callback
  *
- * Install by calling IntegrityProxy.install(loader, pkgName) from
- * BlackBoxCore.doAttachBaseContext() when pkgName == "com.whatsapp".
+ * This gives WhatsApp a valid com.whatsapp Play Integrity token → server accepts → ✅
  */
 public final class IntegrityProxy {
 
     private static final String TAG = "IntegrityProxy";
 
-    // Must match WaEnhancer IntegrityBridge constants exactly
     public static final String ACTION_REQUEST  = "com.blackbox.integrity.REQUEST";
     public static final String ACTION_RESPONSE = "com.blackbox.integrity.RESPONSE";
     public static final String EXTRA_NONCE     = "nonce";
@@ -41,216 +50,296 @@ public final class IntegrityProxy {
     public static final String EXTRA_TOKEN     = "token";
     public static final String EXTRA_ERROR     = "error";
 
-    private static final String REAL_WA_PKG        = "com.whatsapp";
-    private static final long   BRIDGE_TIMEOUT_MS   = 12_000;
+    private static final String REAL_WA_PKG      = "com.whatsapp";
+    private static final long   BRIDGE_TIMEOUT_MS = 15_000;
 
-    private static volatile boolean sInstalled = false;
+    // ── Connection proxy ──────────────────────────────────────────────────────
+
+    public static IServiceConnection createConnectionProxy(
+            IServiceConnection real, Intent intent) {
+        return new IntegrityConnectionProxy(real);
+    }
+
+    private static class IntegrityConnectionProxy extends IServiceConnection.Stub {
+        private final IServiceConnection mReal;
+        IntegrityConnectionProxy(IServiceConnection real) { this.mReal = real; }
+
+        @Override public void connected(ComponentName name, IBinder service) throws RemoteException {
+            connected(name, service, false);
+        }
+
+        @Override
+        public boolean onTransact(int code, Parcel data, Parcel reply, int flags)
+                throws RemoteException {
+            if (BuildCompat.isQ() /* API 37 = V */ && Build.VERSION.SDK_INT >= 37
+                    && code == android.os.IBinder.FIRST_CALL_TRANSACTION) {
+                data.enforceInterface(DESCRIPTOR);
+                ComponentName name = (data.readInt() != 0)
+                        ? ComponentName.CREATOR.createFromParcel(data) : null;
+                IBinder service = data.readStrongBinder();
+                if (data.dataAvail() > 4) data.readStrongBinder(); // IBinderSession (API 37)
+                boolean dead = data.readBoolean();
+                connected(name, service, dead);
+                if (reply != null) reply.writeNoException();
+                return true;
+            }
+            return super.onTransact(code, data, reply, flags);
+        }
+
+        public void connected(ComponentName name, IBinder service, boolean dead)
+                throws RemoteException {
+            Slog.d(TAG, "IntegrityConnectionProxy.connected: " + name);
+            IBinder proxied = service != null ? new IntegrityBinderProxy(service) : null;
+            if (BuildCompat.isOreo()) {
+                try { BRIServiceConnectionO.get(mReal).connected(name, proxied, dead); return; }
+                catch (Throwable ignored) {}
+            }
+            mReal.connected(name, proxied);
+        }
+    }
+
+    // ── Service Binder proxy ──────────────────────────────────────────────────
 
     /**
-     * Hook IntegrityManagerFactory.createStandard() so the returned manager
-     * proxies token requests through WaEnhancer in the real WhatsApp process.
-     * Safe to call multiple times — only installs once.
+     * Wraps ExpressIntegrityService IBinder.
+     * Transaction 2 = requestExpressIntegrityToken(request, callback) — we wrap the callback.
+     * All other transactions are forwarded transparently.
      */
-    public static void install(ClassLoader loader, String virtualPackage) {
-        if (sInstalled) return;
-        if (!REAL_WA_PKG.equals(virtualPackage)) return;
+    private static class IntegrityBinderProxy extends android.os.Binder {
+        private final IBinder mReal;
+        private static final int TXN_REQUEST = 2;
 
-        try {
-            patchFactory(loader);
-            sInstalled = true;
-            Slog.d(TAG, "Installed for " + virtualPackage);
-        } catch (ClassNotFoundException e) {
-            // Play Core not in this build — skip silently
-            Slog.d(TAG, "Play Core not found in classloader, skipping");
-        } catch (Throwable t) {
-            Slog.e(TAG, "Install failed: " + t.getMessage());
+        IntegrityBinderProxy(IBinder real) { mReal = real; }
+
+        @Override public String getInterfaceDescriptor() {
+            try { return mReal.getInterfaceDescriptor(); } catch (Throwable t) { return null; }
+        }
+
+        @Override
+        protected boolean onTransact(int code, Parcel data, Parcel reply, int flags)
+                throws RemoteException {
+            if (code == TXN_REQUEST) {
+                return handleRequestToken(code, data, reply, flags);
+            }
+            return mReal.transact(code, data, reply, flags);
+        }
+
+        private boolean handleRequestToken(int code, Parcel data, Parcel reply, int flags)
+                throws RemoteException {
+            // Marshal the original parcel bytes
+            data.setDataPosition(0);
+            byte[] raw = data.marshall();
+
+            // Find the callback Binder position: it's the LAST IBinder in the Parcel.
+            // We reconstruct a Parcel, skip everything until only the callback remains.
+            // Simpler: forward the call, but wrap the callback IBinder by parsing the data.
+            Parcel scan = Parcel.obtain();
+            scan.unmarshall(raw, 0, raw.length);
+            scan.setDataPosition(0);
+
+            IBinder callbackBinder = null;
+            try {
+                // Skip interface descriptor
+                String desc = scan.readString();
+                // Skip request bytes (written as a proto byte array or an int+bytes)
+                int marker = scan.readInt();
+                if (marker > 0) {
+                    // Positive int = length prefix for byte array
+                    scan.setDataPosition(scan.dataPosition() + marker);
+                } else if (marker == -1) {
+                    // -1 = null byte array (no request data)
+                } else if (marker == 0) {
+                    // No data or presence flag = 0 (no object)
+                }
+                callbackBinder = scan.readStrongBinder();
+            } catch (Throwable t) {
+                Slog.w(TAG, "handleRequestToken: parse failed: " + t);
+            } finally {
+                scan.recycle();
+            }
+
+            if (callbackBinder != null) {
+                // Replace the callback with our proxy in the forwarded Parcel
+                Parcel modified = Parcel.obtain();
+                modified.unmarshall(raw, 0, raw.length);
+                modified.setDataPosition(0);
+                try {
+                    modified.readString(); // skip descriptor
+                    int m = modified.readInt();
+                    if (m > 0) modified.setDataPosition(modified.dataPosition() + m);
+                    // Now at the callback position — write our proxy binder
+                    IBinder wrappedCallback = new IntegrityCallbackProxy(callbackBinder);
+                    modified.writeStrongBinder(wrappedCallback);
+                    modified.setDataPosition(0);
+                    boolean result = mReal.transact(code, modified, reply, flags);
+                    modified.recycle();
+                    return result;
+                } catch (Throwable t) {
+                    Slog.w(TAG, "handleRequestToken: rebuild failed: " + t);
+                    modified.recycle();
+                }
+            }
+
+            // Fallback: forward unchanged
+            data.setDataPosition(0);
+            return mReal.transact(code, data, reply, flags);
         }
     }
 
-    private static void patchFactory(ClassLoader loader) throws Exception {
-        Class<?> factoryClass = Class.forName(
-                "com.google.android.play.core.integrity.IntegrityManagerFactory",
-                true, loader);
-        Method createStandard = factoryClass.getMethod("createStandard", Context.class);
-
-        // Build Task / listener classes for proxy construction
-        Class<?> taskClass    = Class.forName("com.google.android.play.core.tasks.Task",              true, loader);
-        Class<?> successCls   = Class.forName("com.google.android.play.core.tasks.OnSuccessListener", true, loader);
-        Class<?> failureCls   = Class.forName("com.google.android.play.core.tasks.OnFailureListener", true, loader);
-        Class<?> tokenCls     = Class.forName(
-                "com.google.android.play.core.integrity.StandardIntegrityManager$StandardIntegrityToken",
-                true, loader);
-        Class<?> requestCls   = Class.forName(
-                "com.google.android.play.core.integrity.StandardIntegrityManager$StandardIntegrityTokenRequest",
-                true, loader);
-        Class<?> managerCls   = Class.forName(
-                "com.google.android.play.core.integrity.StandardIntegrityManager",
-                true, loader);
-
-        // We replace the return value of createStandard() by wrapping the real manager
-        // with a proxy.  We do this by hooking via ART method replacement using
-        // BlackBox's existing NativeCore infrastructure.
-        // Since NativeCore already has PLT hooks on libart.so, we use a simpler
-        // approach: make createStandard() return our proxy manager directly.
-
-        // Store classes for use in the proxy
-        FactoryHook hook = new FactoryHook(
-                loader, createStandard,
-                managerCls, requestCls, taskClass, successCls, failureCls, tokenCls);
-        hook.apply();
-    }
-
-    // ──────────────────────────────────────────────────────────────────────────
-    // Inner class: hooks createStandard() and manages the proxy manager
-    // ──────────────────────────────────────────────────────────────────────────
-
-    private static class FactoryHook {
-        final ClassLoader loader;
-        final Method      createStandard;
-        final Class<?>    managerCls, requestCls, taskCls, successCls, failureCls, tokenCls;
-
-        FactoryHook(ClassLoader loader, Method cs,
-                    Class<?> mgr, Class<?> req, Class<?> task,
-                    Class<?> suc, Class<?> fail, Class<?> tok) {
-            this.loader        = loader;
-            this.createStandard = cs;
-            this.managerCls    = mgr;
-            this.requestCls    = req;
-            this.taskCls       = task;
-            this.successCls    = suc;
-            this.failureCls    = fail;
-            this.tokenCls      = tok;
-        }
-
-        void apply() {
-            // Use de.robv.android.xposed.XposedHelpers-style method hook via
-            // BlackBox's HookManager if available, else use field reflection.
-            // Since we're already inside the virtual app's process after
-            // BlackBox loads all hooks, we can use direct method interception
-            // by replacing the factory's method body at the JVM level using
-            // our existing ART hook infrastructure.
-
-            // Simplified: we intercept by registering a static holder that
-            // BlackBoxCore.doAttachBaseContext() can check BEFORE the first
-            // Play Core call occurs. The actual interception happens in
-            // BlackBoxCore via IActivityManagerProxy's existing bind hook:
-            // when ExpressIntegrityService binds, we wrap the IBinder with
-            // a proxy that calls our bridge. See IntegrityProxy.wrapToken().
-            Slog.d(TAG, "FactoryHook: proxy manager ready (bridge mode)");
-        }
-    }
-
-    // ──────────────────────────────────────────────────────────────────────────
-    // Public entry point — called from IActivityManagerProxy when the virtual
-    // WhatsApp's Play Core SDK requests an integrity token via GMS.
-    // Intercepts the nonce from the pending bind and routes it to WaEnhancer.
-    // ──────────────────────────────────────────────────────────────────────────
+    // ── Callback proxy ────────────────────────────────────────────────────────
 
     /**
-     * Build a fake Task that, when addOnSuccessListener() is called, queries
-     * WaEnhancer for a real com.whatsapp token and delivers it to the listener.
-     *
-     * Called from BindServiceCommon when we detect an ExpressIntegrityService
-     * bind and want to replace the token result transparently.
-     *
-     * @param nonce  The integrity nonce extracted from the token request
-     * @param loader The virtual WhatsApp's ClassLoader
-     * @return A Task proxy delivering the real com.whatsapp token
+     * Wraps Play Core's IRequestExpressIntegrityTokenCallback.
+     * GMS calls onExpressIntegrityToken (code 1) with the token response.
+     * We intercept, extract the nonce, get a real com.whatsapp token from
+     * WaEnhancer, rebuild the response Parcel, and forward to the real callback.
      */
-    public static Object buildBridgedTask(String nonce, ClassLoader loader) {
-        return buildBridgedTaskInternal(nonce, loader);
-    }
+    private static class IntegrityCallbackProxy extends android.os.Binder {
+        private final IBinder mReal;
+        private static final int TXN_ON_TOKEN = 1;
 
-    private static Object buildBridgedTaskInternal(String nonce, ClassLoader loader) {
-        try {
-            Class<?> taskCls    = Class.forName("com.google.android.play.core.tasks.Task",              true, loader);
-            Class<?> successCls = Class.forName("com.google.android.play.core.tasks.OnSuccessListener", true, loader);
-            Class<?> failureCls = Class.forName("com.google.android.play.core.tasks.OnFailureListener", true, loader);
-            Class<?> tokenCls   = Class.forName(
-                    "com.google.android.play.core.integrity.StandardIntegrityManager$StandardIntegrityToken",
-                    true, loader);
+        IntegrityCallbackProxy(IBinder real) { mReal = real; }
 
-            return Proxy.newProxyInstance(loader,
-                    new Class[]{taskCls},
-                    (proxy, method, args) -> {
-                        if ("addOnSuccessListener".equals(method.getName()) && args != null && args.length == 1) {
-                            // Fetch the real token on a background thread to avoid ANR
-                            new Thread(() -> {
-                                String realToken = fetchTokenFromBridge(nonce);
-                                if (realToken == null) {
-                                    Slog.w(TAG, "Bridge returned no token — calling onFailure");
-                                    try {
-                                        Class<?> failureLCls = Class.forName(
-                                                "com.google.android.play.core.tasks.OnFailureListener",
-                                                true, loader);
-                                        // Leave the listener hanging — GMS will timeout naturally
-                                    } catch (Throwable ignored) {}
-                                    return;
-                                }
-                                try {
-                                    // Wrap the token string in a fake StandardIntegrityToken
-                                    Object fakeToken = Proxy.newProxyInstance(loader,
-                                            new Class[]{tokenCls},
-                                            (p, m, a) -> "token".equals(m.getName()) ? realToken : null);
-                                    Method onSuccess = successCls.getMethod("onSuccess", Object.class);
-                                    onSuccess.invoke(args[0], fakeToken);
-                                    Slog.d(TAG, "Delivered real com.whatsapp token to listener");
-                                } catch (Throwable t) {
-                                    Slog.e(TAG, "onSuccess delivery failed: " + t);
-                                }
-                            }, "integrity-bridge").start();
-                            return proxy;
-                        }
-                        if ("addOnFailureListener".equals(method.getName())) return proxy;
-                        if ("isSuccessful".equals(method.getName())) return false; // not done yet
-                        return null;
-                    });
-        } catch (Throwable t) {
-            Slog.e(TAG, "buildBridgedTask failed: " + t);
-            return null;
+        @Override public String getInterfaceDescriptor() {
+            try { return mReal.getInterfaceDescriptor(); } catch (Throwable t) { return null; }
+        }
+
+        @Override
+        protected boolean onTransact(int code, Parcel data, Parcel reply, int flags)
+                throws RemoteException {
+            if (code == TXN_ON_TOKEN) {
+                Slog.d(TAG, "IntegrityCallbackProxy: onExpressIntegrityToken intercepted");
+                return handleTokenDelivery(data, reply, flags);
+            }
+            return mReal.transact(code, data, reply, flags);
+        }
+
+        private boolean handleTokenDelivery(Parcel data, Parcel reply, int flags)
+                throws RemoteException {
+            data.setDataPosition(0);
+            byte[] raw = data.marshall();
+
+            // Extract the token JWT from the response Parcel (best-effort)
+            String wrongToken = extractTokenFromParcel(raw);
+            String nonce = wrongToken != null ? extractNonceFromJwt(wrongToken) : "";
+
+            Slog.d(TAG, "Wrong-package token nonce: "
+                    + nonce.substring(0, Math.min(20, nonce.length())) + "…");
+
+            // Bridge to WaEnhancer
+            String realToken = fetchTokenFromBridge(nonce);
+
+            if (realToken != null) {
+                Slog.d(TAG, "Real com.whatsapp token obtained ✅ — rebuilding response Parcel");
+                byte[] rebuilt = rebuildResponseParcel(raw, realToken);
+                if (rebuilt != null) {
+                    Parcel newData = Parcel.obtain();
+                    newData.unmarshall(rebuilt, 0, rebuilt.length);
+                    newData.setDataPosition(0);
+                    boolean result = mReal.transact(TXN_ON_TOKEN, newData, reply, flags);
+                    newData.recycle();
+                    return result;
+                }
+            }
+
+            Slog.w(TAG, "Bridge failed — forwarding original wrong-package token");
+            data.setDataPosition(0);
+            return mReal.transact(TXN_ON_TOKEN, data, reply, flags);
+        }
+
+        private String extractTokenFromParcel(byte[] raw) {
+            String s = new String(raw);
+            int idx = s.indexOf("eyJ"); // JWT header prefix (base64 for '{"')
+            if (idx < 0) return null;
+            int end = idx;
+            while (end < s.length() && isJwtChar(s.charAt(end))) end++;
+            String jwt = s.substring(idx, end);
+            return jwt.contains(".") ? jwt : null; // must have at least one '.'
+        }
+
+        private boolean isJwtChar(char c) {
+            return Character.isLetterOrDigit(c) || c == '.' || c == '_' || c == '-' || c == '=';
+        }
+
+        private String extractNonceFromJwt(String jwt) {
+            try {
+                String[] parts = jwt.split("\\.");
+                if (parts.length < 2) return "";
+                byte[] payloadBytes = android.util.Base64.decode(
+                        parts[1], android.util.Base64.URL_SAFE | android.util.Base64.NO_PADDING);
+                String payload = new String(payloadBytes);
+                for (String key : new String[]{"\"nonce\":", "\"requestHash\":", "\"rhs\":"}) {
+                    int i = payload.indexOf(key);
+                    if (i >= 0) {
+                        i += key.length();
+                        if (i < payload.length() && payload.charAt(i) == '"') i++;
+                        int end = payload.indexOf('"', i);
+                        if (end > i) return payload.substring(i, end);
+                    }
+                }
+            } catch (Throwable t) {
+                Slog.w(TAG, "extractNonceFromJwt: " + t);
+            }
+            return "";
+        }
+
+        private byte[] rebuildResponseParcel(byte[] raw, String realToken) {
+            try {
+                String s = new String(raw);
+                String wrongJwt = extractTokenFromParcel(raw);
+                if (wrongJwt == null) return null;
+                // Replace the first occurrence of the wrong JWT with the real one
+                String replaced = s.replaceFirst(
+                        java.util.regex.Pattern.quote(wrongJwt), realToken);
+                return replaced.getBytes();
+            } catch (Throwable t) {
+                Slog.w(TAG, "rebuildResponseParcel: " + t);
+                return null;
+            }
         }
     }
 
-    /** Send the nonce to WaEnhancer and wait for the real token. */
+    // ── Bridge ────────────────────────────────────────────────────────────────
+
     public static String fetchTokenFromBridge(String nonce) {
         Context ctx = BlackBoxCore.getContext();
-        if (ctx == null) {
-            Slog.w(TAG, "No context for bridge request");
-            return null;
-        }
+        if (ctx == null) { Slog.w(TAG, "fetchTokenFromBridge: no context"); return null; }
 
         CountDownLatch latch = new CountDownLatch(1);
         AtomicReference<String> result = new AtomicReference<>(null);
 
-        BroadcastReceiver responseReceiver = new BroadcastReceiver() {
-            @Override
-            public void onReceive(Context context, Intent intent) {
-                if (!ACTION_RESPONSE.equals(intent.getAction())) return;
-                String token = intent.getStringExtra(EXTRA_TOKEN);
-                String error = intent.getStringExtra(EXTRA_ERROR);
-                if (error != null) Slog.w(TAG, "Bridge error from WaEnhancer: " + error);
+        BroadcastReceiver resp = new BroadcastReceiver() {
+            @Override public void onReceive(Context c, Intent i) {
+                if (!ACTION_RESPONSE.equals(i.getAction())) return;
+                String token = i.getStringExtra(EXTRA_TOKEN);
+                String error = i.getStringExtra(EXTRA_ERROR);
+                if (error != null) Slog.w(TAG, "Bridge error: " + error);
                 result.set(token);
                 latch.countDown();
             }
         };
 
-        ctx.registerReceiver(responseReceiver, new IntentFilter(ACTION_RESPONSE));
+        ctx.registerReceiver(resp, new IntentFilter(ACTION_RESPONSE));
         try {
             Intent req = new Intent(ACTION_REQUEST);
             req.setPackage(REAL_WA_PKG);
             req.putExtra(EXTRA_NONCE, nonce);
             req.putExtra(EXTRA_REQUESTOR, ctx.getPackageName());
             ctx.sendBroadcast(req);
-
-            Slog.d(TAG, "Nonce sent to " + REAL_WA_PKG + ", awaiting token…");
-            boolean ok = latch.await(BRIDGE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-            if (!ok) Slog.w(TAG, "Bridge timed out (" + BRIDGE_TIMEOUT_MS + "ms)");
+            Slog.d(TAG, "Nonce sent to " + REAL_WA_PKG + " — awaiting token…");
+            if (!latch.await(BRIDGE_TIMEOUT_MS, TimeUnit.MILLISECONDS))
+                Slog.w(TAG, "Bridge timed out after " + BRIDGE_TIMEOUT_MS + "ms");
         } catch (Throwable t) {
-            Slog.e(TAG, "fetchTokenFromBridge: " + t.getMessage());
+            Slog.e(TAG, "fetchTokenFromBridge: " + t);
         } finally {
-            try { ctx.unregisterReceiver(responseReceiver); } catch (Throwable ignored) {}
+            try { ctx.unregisterReceiver(resp); } catch (Throwable ignored) {}
         }
-
         return result.get();
     }
+
+    // Legacy entry points
+    public static void install(ClassLoader loader, String virtualPackage) {
+        Slog.d(TAG, "IntegrityProxy ready for " + virtualPackage + " (connection-proxy mode)");
+    }
+    public static Object buildBridgedTask(String nonce, ClassLoader loader) { return null; }
 }
