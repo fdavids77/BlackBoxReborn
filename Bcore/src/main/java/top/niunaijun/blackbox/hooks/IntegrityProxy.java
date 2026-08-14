@@ -42,6 +42,14 @@ public final class IntegrityProxy {
     public static final String EXTRA_REQUESTOR = "requestor";
     public static final String EXTRA_TOKEN     = "token";
     public static final String EXTRA_ERROR     = "error";
+    public static final String EXTRA_CLOUD_PROJECT = "cloud_project";
+
+    /**
+     * WhatsApp's Google Cloud project number, captured from the virtual WhatsApp's
+     * Express Integrity prepare/warm-up transaction. Forwarded to WaEnhancer so it
+     * never has to hardcode the value. 0 = not captured yet.
+     */
+    private static volatile long sCloudProject = 0L;
 
     private static final String REAL_WA_PKG      = "com.whatsapp";
     private static final long   BRIDGE_TIMEOUT_MS = 12_000;
@@ -118,6 +126,20 @@ public final class IntegrityProxy {
                     android.os.Parcel reply, int flags)
                     throws android.os.RemoteException {
 
+                // Diagnostic: the Express Integrity service is callback-based, so the
+                // token is delivered on a separate callback binder, not in `reply`.
+                // Log every transaction to map the real protocol from logcat before
+                // relying on the synchronous reply path below.
+                try {
+                    Slog.d(TAG, "IntegrityService onTransact code=" + code
+                            + " dataSize=" + data.dataSize() + " flags=" + flags
+                            + " iface=" + realBinder.getInterfaceDescriptor());
+                } catch (Throwable ignored) {}
+
+                // Capture WhatsApp's cloud project number from the prepare/warm-up
+                // transaction so we can forward it to WaEnhancer (avoids hardcoding).
+                try { captureCloudProject(code, data); } catch (Throwable ignored) {}
+
                 // Play Core sends FIRST_CALL_TRANSACTION (1) for requestIntegrityToken.
                 // We intercept it, extract the nonce, bridge to WaEnhancer.
                 // For all other transactions, pass through to the real service.
@@ -156,6 +178,43 @@ public final class IntegrityProxy {
                 return realBinder.transact(code, data, reply, flags);
             }
         };
+    }
+
+    /**
+     * Best-effort scan of an Express Integrity transaction parcel for WhatsApp's
+     * cloud project number. GCP project numbers are ~10–13 digit values; we walk
+     * the raw 32-bit words and assemble little-endian longs, taking the first value
+     * in a plausible range. Reading is non-destructive (position is restored).
+     *
+     * This is heuristic — the exact match is confirmed from the logged candidate.
+     * Once known, the value is stable and can be hardcoded in WaEnhancer.
+     */
+    private static void captureCloudProject(int code, android.os.Parcel data) {
+        if (sCloudProject > 0) return;
+        int saved = data.dataPosition();
+        try {
+            int words = data.dataSize() / 4;
+            if (words < 2) return;
+            data.setDataPosition(0);
+            int[] w = new int[words];
+            for (int i = 0; i < words; i++) w[i] = data.readInt();
+            for (int i = 0; i + 1 < words; i++) {
+                long lo  = ((long) w[i])     & 0xFFFFFFFFL;
+                long hi  = ((long) w[i + 1]) & 0xFFFFFFFFL;
+                long val = (hi << 32) | lo;                 // little-endian
+                // GCP project numbers: ~10 to 13 digits.
+                if (val >= 1_000_000_000L && val <= 9_999_999_999_999L) {
+                    sCloudProject = val;
+                    Slog.d(TAG, "Captured candidate cloudProjectNumber=" + val
+                            + " (txn code=" + code + ")");
+                    return;
+                }
+            }
+        } catch (Throwable t) {
+            Slog.w(TAG, "captureCloudProject: " + t);
+        } finally {
+            try { data.setDataPosition(saved); } catch (Throwable ignored) {}
+        }
     }
 
     /**
@@ -213,7 +272,15 @@ public final class IntegrityProxy {
             Intent req = new Intent(ACTION_REQUEST);
             req.setPackage(REAL_WA_PKG);
             req.putExtra(EXTRA_NONCE, nonce);
-            req.putExtra(EXTRA_REQUESTOR, ctx.getPackageName());
+            // Requestor MUST be the BlackBox host package. WaEnhancer replies with
+            // setPackage(requestor) through the real AMS; using the virtual package
+            // ("com.whatsapp") would route the token to the REAL WhatsApp app instead
+            // of back to this host-owned virtual process.
+            req.putExtra(EXTRA_REQUESTOR, BlackBoxCore.getHostPkg());
+            if (sCloudProject > 0) {
+                req.putExtra(EXTRA_CLOUD_PROJECT, sCloudProject);
+                Slog.d(TAG, "Forwarding cloudProjectNumber=" + sCloudProject + " to WaEnhancer");
+            }
             ctx.sendBroadcast(req);
 
             Slog.d(TAG, "Nonce broadcast sent to " + REAL_WA_PKG + ", awaiting token...");

@@ -165,3 +165,74 @@ WaEnhancer (C:\Users\w7037127\Downloads\Software\Android Development\WaEnhancer)
     core/FeatureLoader.java                   ← IntegrityBridge registered in plugins()
   app/src/main/res/values/arrays.xml          ← version support extended to 2.26.30.xx
 ```
+
+
+---
+
+## Phase 2B Update — 2026-08-14 (bundled StandardIntegrityManager)
+
+**Decision:** dropped the raw-Binder-to-ExpressIntegrityService plan. The Express
+service is a two-phase warm-up/request protocol with internal client-side token
+assembly and a callback-based reply — not a simple nonce-in/token-out transaction,
+so a hand-rolled Binder transaction is high-risk. Instead WaEnhancer now **bundles
+the official Play Integrity library** and calls `StandardIntegrityManager` directly
+from inside the real `com.whatsapp` process. Obfuscation and crypto are handled by
+Google's own code. (See WaEnhancer `INTEGRITY_BRIDGE.md`.)
+
+### WaEnhancer side — DONE (buildable)
+- `IntegrityBridge.java` rewritten: bundled `StandardIntegrityManager`,
+  `prepareIntegrityToken(cpn)` cached + warmed, `request(requestHash)` per bridge
+  request, token returned via `ACTION_RESPONSE`. Compile-verified against
+  Play Integrity 1.4.0.
+- `build.gradle.kts` + `libs.versions.toml`: added `com.google.android.play:integrity:1.4.0`.
+- Needs WhatsApp's **cloud project number** to actually mint a token (pref
+  `integrity_cloud_project`, or `cloud_project` broadcast extra, or hardcode).
+
+### BlackBox side — trigger wired + routing fix
+- `BindServiceCommon` already wraps the integrity `IServiceConnection` and routes
+  through `IntegrityProxy` (present since v2.0.0 commit). Confirmed.
+- **Fix:** `IntegrityProxy.fetchTokenFromBridge` now sets `requestor =
+  BlackBoxCore.getHostPkg()` (was the virtual package). The virtual package would
+  have routed WaEnhancer's `setPackage(requestor)` reply to the REAL WhatsApp app
+  instead of back to this host-owned virtual process.
+- Added per-transaction diagnostic logging in the wrapped integrity binder.
+
+### Remaining hard problem (next session)
+- The Express service delivers the token on a **separate callback binder**, not in
+  the transaction `reply`. So `IntegrityProxy.onTransact` writing the bridged token
+  into `reply` will not reach WhatsApp's success listener as-is. Use the new
+  `onTransact code/dataSize/iface` logs to map the real protocol, then either:
+  (a) intercept the callback binder and deliver the token through it, or
+  (b) capture `requestHash` + `cloudProjectNumber` from the transaction and inject
+      the bridged token higher up (e.g. where WA inserts it into the registration
+      HTTP payload).
+- Also forward the captured `cloudProjectNumber` to WaEnhancer as the
+  `cloud_project` broadcast extra so it need not be hardcoded.
+
+
+### Update — cloudProjectNumber auto-capture (implemented)
+
+- `IntegrityProxy` now scans each Express Integrity transaction parcel for a
+  plausible GCP project number (10–13 digit little-endian long, position-restoring
+  read) and caches it (`sCloudProject`). It is forwarded to WaEnhancer as the
+  `cloud_project` broadcast extra, so WaEnhancer no longer needs it hardcoded.
+- Heuristic: confirm the real value from the logged `Captured candidate
+  cloudProjectNumber=...` line, then it can be pinned if desired.
+- Both APKs rebuilt clean: WaEnhancer `app-whatsapp-release.apk`,
+  BlackBox `BlackBox_4.0.0_*-debug.apk` (BUILD SUCCESSFUL).
+
+
+## Adding more WhatsApp numbers (future capability)
+
+BlackBox virtual WhatsApp cannot register (integrity/parole). Every number must be
+registered where WhatsApp passes integrity, then migrated in. Repeatable loop:
+
+1. Register the new number in a spare Android user (like users 11–15) — receive its OTP there.
+2. In BlackBox, add a new WhatsApp clone → creates the next container slot (`user/1`, `user/2`, …). One container per number. (For the first one you can reuse container `0`.)
+3. Migrate:  `su -c "sh /data/local/tmp/wa_migrate.sh <SRC_USER> <CONTAINER>"`  (script in `tools/wa_migrate.sh`).
+4. Launch the clone in BlackBox → boots registered. Retire the source user so the number runs only in BlackBox.
+
+Notes: source and container WhatsApp versions must match. Never run the source user's WA
+and the migrated clone at the same time (same number → one gets logged out). Host BlackBox
+app must hold the runtime permissions (contacts/storage/media/camera/mic/phone) — grant via
+`pm grant top.niunaijun.blackbox <perm>` or Settings; the clone inherits them.
